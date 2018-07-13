@@ -1,6 +1,4 @@
 import Hourglass
-from keras.models import *
-from keras.layers import *
 from keras.optimizers import *
 import os
 import pickle
@@ -42,16 +40,16 @@ y_test=np.array(list(map(lambda x:base_path+x,y_test)))
 print(X_train.shape,mask_train.shape,y_train.shape)
 print(X_test.shape,mask_train.shape,y_test.shape)
 
-def generate_mesh(X_list, mask_list, y_list, batch_size=32, shuffle=True):
-    while True:
-        count=0
-        x, mask, y = [],[],[]
-        if shuffle:
-            random_index=np.arange(X_list.shape[0])
-            np.random.shuffle(random_index)
-            X_list=X_list[random_index]
-            mask_list=mask_list[random_index]
-            y_list=y_list[random_index]
+def cal_ETA(t_start, i, n_batch):
+    t_temp = time.time()
+    t_avg = float(int(t_temp) - int(t_start)) / float(i + 1)
+    if n_batch - i - 1 > 0:
+        return int((n_batch - i - 1) * t_avg)
+    else:
+        return int(t_temp)-int(t_start)
+
+def data_generate(X_list, mask_list, y_list, nstack):
+        x, mask, y = [], [], []
         for i,path in enumerate(X_list):
             img = io.imread(path)
             img = transform.resize(img,(224,176))
@@ -64,36 +62,84 @@ def generate_mesh(X_list, mask_list, y_list, batch_size=32, shuffle=True):
             x.append(img)
             mask.append(img_mask)
             y.append(y_temp)
-            count+=1
-            if count == batch_size:
-                x = np.array(x)
-                x = np.reshape(x,(batch_size, 224, 176, 3))
-                mask = np.array(mask)
-                mask = np.reshape(mask, (batch_size, 224, 176, 1))
-                y = np.array(y)
-                y = np.reshape(y, (batch_size, 224, 176, 3))
-                yield [x, mask], [y, mask * y, y, mask * y]
-                x, mask, y = [], [], []
-                count = 0
 
+        x = np.array(x)
+        x = np.reshape(x,(batch_size, 224, 176, 3))
+        mask = np.array(mask)
+        mask = np.reshape(mask, (batch_size, 224, 176, 1))
+        y = np.array(y)
+        y = np.reshape(y, (batch_size, 224, 176, 3))
+        return [x, mask], [y, mask * y] * nstack
+
+# hyper-parameter
 epoch_num=20
 batch_size=32
 batch_size_test=32
-model=Hourglass.model()
-model=multi_gpu_model(model,gpus=2)
-model.summary()
-early_stop = EarlyStopping(monitor='loss', patience=3, verbose=1, mode='auto')
-check_point= ModelCheckpoint('model/Hourglass_weightsV2.h5', monitor='loss',verbose=0, save_best_only=True,\
-                             save_weights_only=True, mode='auto', period=1)
-# def schedule(epoch):
-#     # 动态调整
-#     return 0.0005*(0.98**epoch)
-# learning_rate=LearningRateScheduler(schedule)
-optimizer = Adam(lr=0.0005, beta_1=0.9, beta_2=0.99, epsilon=1e-08)
-model.compile(loss='mse', optimizer=optimizer)
+patience = 2
 
-model.fit_generator(generate_mesh(X_train,mask_train,y_train,batch_size),len(X_train)//batch_size,\
-                    epochs=epoch_num,\
-                    validation_data=generate_mesh(X_test,mask_test,y_test,batch_size_test,shuffle=False),\
-                    validation_steps=len(X_test)//batch_size_test,\
-                    callbacks=[early_stop,check_point])
+nstack=2
+level=4
+filter=128
+
+with tf.device('/cpu:0'):
+    model=Hourglass.model(input_shape=(224, 176, 3), nstack=nstack, level=level, module=1, filters=filter)
+
+model.summary()
+parallel_model = multi_gpu_model(model,gpus=2)
+
+optimizer = Adam(lr=0.0005, beta_1=0.9, beta_2=0.99, epsilon=1e-08)
+parallel_model.compile(loss='mse', optimizer=optimizer)
+
+# train on batch
+n_batch = len(X_train)//batch_size
+n_batch_val = len(X_test)//batch_size
+lower_count = 0
+best_loss = 999.
+
+for epoch in range(epoch_num):
+    total_loss = [0] * nstack
+    t_start = time.time()
+    last_train_str = "\r"
+    random_index = np.arange(X_train.shape[0])
+    np.random.shuffle(random_index)
+    X_train = X_train[random_index]
+    mask_train = mask_train[random_index]
+    y_train = y_train[random_index]
+
+    # train
+    for i in range(10):#n_batch
+        x_temp, y_temp = data_generate(X_train[i*batch_size:(i+1)*batch_size],
+                                       mask_train[i*batch_size:(i+1)*batch_size],
+                                       y_train[i*batch_size:(i+1)*batch_size],
+                                       nstack = nstack)
+        loss_value = parallel_model.train_on_batch(x_temp, y_temp)
+        for s in range(nstack):
+            total_loss[s] += (loss_value[2*s+1]+loss_value[2*s+2])
+        last_train_str = "\r[epoch:%d/%d, steps:%d/%d] -ETA: %ds -loss1:%.3f -loss2:%.3f" % (
+            epoch + 1, epoch_num, i + 1, n_batch, cal_ETA(t_start, i, n_batch), total_loss[0] / (i + 1), total_loss[1] / (i + 1))
+        print(last_train_str, end='     ', flush=True)
+
+    # validate
+    total_loss = [0] * nstack
+    for i in range(10):#n_batch_val
+        x_temp, y_temp = data_generate(X_test[i*batch_size:(i+1)*batch_size],
+                                       mask_test[i*batch_size:(i+1)*batch_size],
+                                       y_test[i*batch_size:(i+1)*batch_size],
+                                       nstack = nstack)
+        loss_value = parallel_model.train_on_batch(x_temp, y_temp)
+        for s in range(nstack):
+            total_loss[s] += (loss_value[2*s+1]+loss_value[2*s+2])
+        last_val_str = last_train_str + "  [validate:%d/%d] -loss1:%.3f -loss2:%.3f" % (
+            i + 1, n_batch_val, total_loss[0] / (i + 1), total_loss[1] / (i + 1))
+        print(last_val_str, end='      ', flush=True)
+    val_loss = min(total_loss[0] / n_batch_val, total_loss[1] / n_batch_val)
+    print('\n')
+    if val_loss < best_loss:
+        lower_count = 0
+        best_loss = val_loss
+        model.save('model/Hourglass_modelsV3_epoch+' + str(epoch + 1) + '.h5')
+    else:
+        lower_count +=1
+        if lower_count>=patience:
+            print('stopped with early stopping...')
+            break
